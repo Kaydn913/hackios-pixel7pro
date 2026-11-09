@@ -1,0 +1,5 @@
+/redwood/bin/net_test waitaddr en0 150 wait 5
+/redwood/bin/net_test resolve www.google.com fetch https://www.google.com/
+/redwood/bin/net_test fetch https://example.com/ fetch https://www.apple.com/library/test/success.html
+/redwood/bin/net_test fetch https://speed.cloudflare.com/__down?bytes=5000000
+/redwood/bin/net_test fetch https://speed.cloudflare.com/__down?bytes=20000000

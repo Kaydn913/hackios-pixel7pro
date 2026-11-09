@@ -1,0 +1,276 @@
+diff --git a/meson.build b/meson.build
+index 0ec1288..0c8e5e5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1716,10 +1716,11 @@ else
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if host_machine.system() == 'darwin' and with_gallium_freedreno
++if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_gallium_panfrost)
+   # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
+   # for libdrm (src/redwood-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
+-  # source file is built with freedreno's drm layer, src/freedreno/drm).
++  # source file is built with freedreno's drm layer, src/freedreno/drm, or with panfrost's
++  # kmod, src/panfrost/lib/kmod, when there is no freedreno).
+   dep_libdrm = declare_dependency(
+     include_directories : include_directories('src/redwood-drm'),
+     link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation'],
+diff --git a/src/gallium/drivers/panfrost/pan_bo.c b/src/gallium/drivers/panfrost/pan_bo.c
+index 712987e..1cdf831 100644
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -355,7 +355,11 @@ panfrost_bo_munmap(struct panfrost_bo *bo)
+    if (!bo->ptr.cpu)
+       return;
+ 
++#ifdef __APPLE__
++   if (redwood_drm_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
++#else
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
++#endif
+       mesa_loge("munmap failed: %s", strerror(errno));
+       abort();
+    }
+diff --git a/src/gallium/targets/osmesa/meson.build b/src/gallium/targets/osmesa/meson.build
+index dde1938..6c1e6b0 100644
+--- a/src/gallium/targets/osmesa/meson.build
++++ b/src/gallium/targets/osmesa/meson.build
+@@ -39,7 +39,7 @@ libosmesa = shared_library(
+   ],
+   dependencies : [
+     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
+-    driver_freedreno, idep_xmlconfig, dep_libdrm,
++    driver_freedreno, driver_panfrost, idep_xmlconfig, dep_libdrm,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
+diff --git a/src/gallium/targets/osmesa/osmesa_target.c b/src/gallium/targets/osmesa/osmesa_target.c
+index fa1ecbf..02d17fa 100644
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -65,6 +65,45 @@ osmesa_create_gpu_screen(void)
+       gpu_fd = fd;
+    return screen ? debug_screen_wrap(screen) : NULL;
+ }
++#elif defined(GALLIUM_PANFROST)
++#include <stdio.h>
++#include "panfrost/drm/panfrost_drm_public.h"
++#include "util/driconf.h"
++#include "util/xmlconfig.h"
++#include <xf86drm.h>
++
++static int gpu_fd = -1;
++
++static const driOptionDescription panfrost_options[] = {
++#include "panfrost/driinfo_panfrost.h"
++};
++
++/* The Mali's driver, where the kernel has one (the Pixel 7 Pro's: MaliGPU); NULL: none. */
++static struct pipe_screen *
++osmesa_create_gpu_screen(void)
++{
++   static driOptionCache info, cache;
++   static struct pipe_screen_config config;
++   struct pipe_screen *screen;
++   int fd;
++
++   if (debug_get_bool_option("OSMESA_SOFTWARE", false))
++      return NULL;
++   fd = drmOpenWithType("panthor", NULL, DRM_NODE_RENDER);
++   if (fd < 0) {
++      fprintf(stderr, "osmesa: no Mali (the service MaliGPU): software\n");
++      return NULL;
++   }
++   driParseOptionInfo(&info, panfrost_options, ARRAY_SIZE(panfrost_options));
++   config.options = &cache;
++   config.options_info = &info;
++   screen = panfrost_drm_screen_create(fd, &config);
++   if (screen)
++      gpu_fd = fd;
++   else
++      fprintf(stderr, "osmesa: panfrost did not take the Mali: software\n");
++   return screen ? debug_screen_wrap(screen) : NULL;
++}
+ #endif
+ 
+ 
+@@ -79,7 +118,7 @@ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+ {
+-#ifdef GALLIUM_FREEDRENO
++#if defined(GALLIUM_FREEDRENO) || defined(GALLIUM_PANFROST)
+    struct redwood_drm_surface s = { .surface = surface };
+    struct pipe_resource templ = {
+       .target = PIPE_TEXTURE_2D,
+@@ -118,7 +157,7 @@ osmesa_create_screen(void)
+    struct sw_winsys *winsys;
+    struct pipe_screen *screen;
+ 
+-#ifdef GALLIUM_FREEDRENO
++#if defined(GALLIUM_FREEDRENO) || defined(GALLIUM_PANFROST)
+    screen = osmesa_create_gpu_screen();
+    if (screen)
+       return screen;
+diff --git a/src/panfrost/lib/kmod/meson.build b/src/panfrost/lib/kmod/meson.build
+index 68b94cc..c4a77ae 100644
+--- a/src/panfrost/lib/kmod/meson.build
++++ b/src/panfrost/lib/kmod/meson.build
+@@ -6,6 +6,9 @@ libpankmod_lib_files = files(
+   'panfrost_kmod.c',
+   'panthor_kmod.c',
+ )
++if host_machine.system() == 'darwin' and not with_gallium_freedreno
++  libpankmod_lib_files += files('../../../redwood-drm/redwood_drm.c')
++endif
+ 
+ libpankmod_lib = static_library(
+   'pankmod_lib',
+diff --git a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
+index b69e2ef..337f9e4 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -176,7 +176,13 @@ pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd, uint32_t flags)
+ 
+       p_atomic_inc(&bo->refcnt);
+    } else {
++#ifdef __APPLE__
++      /* the "descriptor" is an IOSurface's ID (src/redwood-drm): the kernel says how big */
++      struct redwood_drm_surface surface = { .surface = (uint32_t)fd };
++      size_t size = redwood_drm_surface(dev->fd, &surface) == 0 ? surface.size : 0;
++#else
+       size_t size = lseek(fd, 0, SEEK_END);
++#endif
+       if (size == 0 || size == (size_t)-1) {
+          mesa_loge("invalid dmabuf size");
+          goto err_close_handle;
+diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index 8b809d4..3c97f60 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -615,8 +615,14 @@ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, off_t bo_offset, size_t size, int prot,
+    if (mmap_offset < 0)
+       return MAP_FAILED;
+ 
++#ifdef __APPLE__
++   /* no device to mmap() on Darwin: the kernel's driver maps it (src/redwood-drm) */
++   host_addr = redwood_drm_mmap(host_addr, size, prot, flags, bo->dev->fd,
++                                mmap_offset + bo_offset);
++#else
+    host_addr = os_mmap(host_addr, size, prot, flags, bo->dev->fd,
+                        mmap_offset + bo_offset);
++#endif
+    if (host_addr == MAP_FAILED) {
+       mesa_loge("mmap(..., size=%zu, prot=%d, flags=0x%x) failed: %s",
+                 size, prot, flags, strerror(errno));
+diff --git a/src/panfrost/lib/kmod/panthor_kmod.c b/src/panfrost/lib/kmod/panthor_kmod.c
+index 6254f01..b3328d5 100644
+--- a/src/panfrost/lib/kmod/panthor_kmod.c
++++ b/src/panfrost/lib/kmod/panthor_kmod.c
+@@ -150,8 +150,13 @@ panthor_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
+    }
+ 
+    /* Map the LATEST_FLUSH_ID register at device creation time. */
++#ifdef __APPLE__
++   panthor_dev->flush_id = redwood_drm_mmap(0, getpagesize(), PROT_READ, MAP_SHARED, fd,
++                                            DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET);
++#else
+    panthor_dev->flush_id = os_mmap(0, getpagesize(), PROT_READ, MAP_SHARED, fd,
+                                    DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET);
++#endif
+    if (panthor_dev->flush_id == MAP_FAILED) {
+       mesa_loge("failed to mmap the LATEST_FLUSH_ID register (err=%d)", errno);
+       goto err_free_dev;
+@@ -194,7 +199,11 @@ panthor_kmod_dev_destroy(struct pan_kmod_dev *dev)
+    struct panthor_kmod_dev *panthor_dev =
+       container_of(dev, struct panthor_kmod_dev, base);
+ 
++#ifdef __APPLE__
++   redwood_drm_munmap(panthor_dev->flush_id, getpagesize());
++#else
+    os_munmap(panthor_dev->flush_id, getpagesize());
++#endif
+    pan_kmod_dev_cleanup(dev);
+    pan_kmod_free(dev->allocator, panthor_dev);
+ }
+@@ -399,7 +408,12 @@ panthor_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, size_t size,
+    /* Create a unsignalled syncobj on import. Will serve as a
+     * temporary container for the exported dmabuf sync file.
+     */
++#ifdef __APPLE__
++   /* no dma-buf sync file will fill it on Darwin: idle until a job of ours uses the buffer */
++   int ret = drmSyncobjCreate(dev->fd, DRM_SYNCOBJ_CREATE_SIGNALED, &panthor_bo->sync.handle);
++#else
+    int ret = drmSyncobjCreate(dev->fd, 0, &panthor_bo->sync.handle);
++#endif
+    if (ret) {
+       mesa_loge("drmSyncobjCreate() failed (err=%d)", errno);
+       goto err_free_bo;
+@@ -422,6 +436,9 @@ panthor_kmod_bo_export(struct pan_kmod_bo *bo, int dmabuf_fd)
+ 
+    bool shared =
+       bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++#ifdef __APPLE__
++   shared = false;      /* (no dma-bufs on Darwin: an IOSurface's buffer waits as any other) */
++#endif
+ 
+    /* If the BO wasn't already shared, we migrate our internal sync points to
+     * the dmabuf itself, so implicit sync can work correctly after this point.
+@@ -485,6 +502,9 @@ panthor_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
+       container_of(bo, struct panthor_kmod_bo, base);
+    bool shared =
+       bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++#ifdef __APPLE__
++   shared = false;      /* (no dma-bufs on Darwin: an IOSurface's buffer waits as any other) */
++#endif
+ 
+    if (shared) {
+       /* If the object is shared, we have to do this export sync-file dance
+@@ -558,6 +578,9 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo, uint32_t sync_handle,
+          : NULL;
+    bool shared =
+       bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++#ifdef __APPLE__
++   shared = false;      /* (no dma-bufs on Darwin: an IOSurface's buffer waits as any other) */
++#endif
+ 
+    if (shared) {
+       /* Reconciling explicit/implicit sync again: we need to import the
+@@ -630,6 +653,9 @@ panthor_kmod_bo_get_sync_point(struct pan_kmod_bo *bo, uint32_t *sync_handle,
+       container_of(bo, struct panthor_kmod_bo, base);
+    bool shared =
+       bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++#ifdef __APPLE__
++   shared = false;      /* (no dma-bufs on Darwin: an IOSurface's buffer waits as any other) */
++#endif
+ 
+    if (shared) {
+       /* Explicit/implicit sync reconciliation point. We need to export
+diff --git a/src/panfrost/lib/pan_props.c b/src/panfrost/lib/pan_props.c
+index 3b0fa99..d5c8a15 100644
+--- a/src/panfrost/lib/pan_props.c
++++ b/src/panfrost/lib/pan_props.c
+@@ -69,6 +69,8 @@ const struct panfrost_model panfrost_model_list[] = {
+         MODEL(0x9093, 0, "G57",    "TNAx", HAS_ANISO,         16384, {}),
+ 
+         MODEL(0xa867, 0, "G610",   "TVIx", HAS_ANISO,         32768, {}),
++        /* (the G610's tile buffer: the G710's is at least as big) */
++        MODEL(0xa862, 0, "G710",   "TODx", HAS_ANISO,         32768, {}),
+         MODEL(0xac74, 0, "G310",   "TVAx", HAS_ANISO,         16384, {}),
+         MODEL(0xac74, 1, "G310",   "TVAx", HAS_ANISO,         16384, {}),
+         MODEL(0xac74, 2, "G310",   "TVAx", HAS_ANISO,         16384, {}),
+@@ -94,6 +96,13 @@ panfrost_get_model(uint32_t gpu_id, uint32_t gpu_variant)
+          return &panfrost_model_list[i];
+    }
+ 
++   /* A variant the list does not have: the model's first (the G710 is listed as variant 0
++    * without knowing what the Pixel 7 Pro's says). */
++   for (unsigned i = 0; i < ARRAY_SIZE(panfrost_model_list); ++i) {
++      if (panfrost_model_list[i].gpu_id == gpu_id)
++         return &panfrost_model_list[i];
++   }
++
+    return NULL;
+ }
+ 

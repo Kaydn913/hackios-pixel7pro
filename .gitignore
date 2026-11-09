@@ -1,0 +1,26 @@
+# Build output: boot images embed the kernel, iOS's system image or vendor firmware
+/pixelboot/out/
+*.img
+*.elf
+*.o
+
+# Your own files: iOS images, kernels, vendor firmware, logs, device-tree dumps (see README)
+/downloads/
+# your HackiOS checkout (README: Building)
+/hackios/
+*.apfs
+*.ipsw
+*.bin
+*.blob
+*.cal
+
+# Wi-Fi credentials: never commit these
+join.c
+join.conf
+pmk.bin
+network
+
+__pycache__/
+*.orig
+*.rej
+*~
